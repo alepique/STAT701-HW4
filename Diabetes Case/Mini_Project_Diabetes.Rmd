@@ -19,10 +19,14 @@ output:
 urlcolor: blue
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, fig.width = 7, fig.height = 4)
+```{r setup}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.height = 4,
+	fig.width = 7
+)
 if(!require("pacman")) install.packages("pacman")
-pacman::p_load(dplyr, ggplot2, glmnet, car, data.table)   #add your packages here
+pacman::p_load(caret, pROC, leaps, dplyr, ggplot2, glmnet, car, data.table)   #add your packages here
 ```
 
 
@@ -46,9 +50,10 @@ Some issues that have come up during the project are similar to many others you 
 
 # Analysis Process
 
-```{r data preparation, include=FALSE}
+```{r data reading, include=FALSE}
 # Notice that we hide the code and the results here
 # Using `include=F` in the chunk declaration. 
+setwd("E:/Dropbox (Penn)/Documentos/2. Educação/1. MBA/3. Actual MBA/2nd Semester/STAT 701 - Modern Data Mining/Homeworks/Homework 4/Diabetes Case")
 readmis <- read.csv("readmission.csv")
 ```
 ## Data Summary / EDA
@@ -65,6 +70,7 @@ summary(readmis)
 names(readmis)
 dim(readmis) #101766 patient
 length(unique(readmis$patient_nbr))
+
 ```
 
 
@@ -93,7 +99,7 @@ Simplicity is key within our models, so it would beneficial to continue to look 
 
 We will first remove $encounter_id$ and $patient_nbr$ for the sake of our analysis, as these are just identifiers that should not be included in the analysis.
 
-```{r modify prediction variable, include=FALSE}
+```{r modify}
 readmis_cln = subset(readmis, select=-c(encounter_id, patient_nbr))
 readmis_cln$readmitted <- as.numeric(readmis_cln$readmitted)
 ```
@@ -101,7 +107,7 @@ readmis_cln$readmitted <- as.numeric(readmis_cln$readmitted)
 ## Analysis
 To begin with capturing important factors, let us start off with a linear model to get quick results.
 
-```{r linear model, include=FALSE}
+```{r linear model}
 fit.first.lm <- lm(readmitted ~., readmis_cln)
 summary(fit.first.lm)
 Anova(fit.first.lm)
@@ -117,11 +123,191 @@ From the *Goals* section above, your study should respond to the following:
 
 1) Identify important factors that capture the chance of a readmission within 30 days. 
 
+Before anything, lets separate our training, validation and testing datasets.
+
+```{r}
+# Split the data:
+N <- length(readmis_cln$readmitted)
+n1 <- floor(.6*N)
+n2 <- floor(.2*N)
+set.seed(10)
+
+# Split data to three portions of .6, .2 and .2 of data size N
+idx_train <- sample(N, n1)
+idx_no_train <- (which(! seq(1:N) %in% idx_train))
+idx_test <- sample( idx_no_train, n2)
+idx_val <- which(! idx_no_train %in% idx_test)
+data.train <- readmis_cln[idx_train,]
+data.test <- readmis_cln[idx_test,]
+data.val <- readmis_cln[idx_val,]
+```
+
+```{r}
+readmis_cln <- data.train
+```
+
+First we will attempt removing some of the variables that seemed non-important according the the lm model, as shows by the Anova above. However, in order to understand whether we can indeed remove them we will make a simple anova() to compare the this reduced model with the complete one. We are using a high threshold of .2 to remove the variables.
+
+```{r}
+readmis_cln.1 <- readmis_cln
+readmis_cln.1$readmitted <- readmis_cln$readmitted-1
+readmis_cln.2 = subset(readmis_cln.1, select=-c(race, time_in_hospital, gender, num_lab_procedures, max_glu_serum, change, num_lab_procedures, glyburide, pioglitazone, rosiglitazone, adm_typ_mod))
+fit.logit.1 <- glm(readmitted ~., readmis_cln.1, family=binomial(logit))
+fit.logit.2 <- glm(readmitted ~., readmis_cln.2, family=binomial(logit))
+anova(fit.logit.1, fit.logit.2, test="Chisq")
+```
+
+As we can see, there's no evidence that the removed variables were important as Pr(>Chi)=.23. So lets further simplify our model, maintaining these excluded variables out. Our current model has 19 variables.
+Now we can run the full Chisquare Anova() and further explore other non-important variables.
+```{r}
+Anova(fit.logit.2)
+```
+Here *number_outpatient* and *glimepiride* seems to be rather unimportant, but lets make sure we can remove both of them when comparing with the full model:
+
+```{r}
+readmis_cln.3 <- subset(readmis_cln.2, select=-c(glimepiride, number_outpatient))
+fit.logit.3 <- glm(readmitted ~., readmis_cln.3, family=binomial(logit))
+anova(fit.logit.2, fit.logit.3, test="Chisq")
+anova(fit.logit.1, fit.logit.3, test="Chisq")
+```
+Observe that even when comparing with the full model (made with *readmis_cln* with 29 variables) there is no evidence support keeping all the variables we removed. So now our subset of variables is *readmis_cln.3* with 17 variables.
+
+Now, lets run a Lasso model to understand which variables indeed contribute the most with our model
+
+```{r}
+X <- model.matrix(readmitted~., data=readmis_cln.3)[,-1] # for each factor: num of levels -1 
+dim(X)
+Y <- readmis_cln.3$readmitted
+set.seed(10) # to have same sets of K folds
+fit1.cv <- cv.glmnet(X, Y, alpha=1, family="binomial", nfolds = 10, type.measure = "deviance")  
+plot(fit1.cv)
+fit1.cv$lambda.1se
+```
+
+I am interested in the model as much reduced as possible, therefore the one with highest *Lambda*, so I'll take the one for 1se.
+
+```{r}
+coef.min <- coef(fit1.cv, s="lambda.1se")  #s=c("lambda.1se","lambda.min") or lambda value
+coef.min <- coef.min[which(coef.min !=0),]   # get the non=zero coefficients
+var.min <- rownames(as.matrix(coef.min))[-1]
+```
+
+Since our original data is composed for factor variables, the Lasso response gives the dummy for each factor level. So simplifying we have that the 1se variables in the lasso are:
+
+```{r}
+varslasso <- c("num_medications", "number_emergency", "number_inpatient", "number_diagnoses", "A1Cresult", "metformin", "insulin", "diabetesMed", "disch_disp_modified", "disch_disp_modified", "age_mod",
+          "diag1_mod", "diag2_mod", "diag3_mod")
+```
+
+In other words, the 1se Lasso lambda excluded the following variables:
+
+```{r}
+excluded <- readmis_cln.3 %>% select(-varslasso, -"readmitted")
+excluded <- names(excluded)
+excluded
+```
+
+
+
 The set of available predictors is not limited to the raw variables in the data set. You may engineer any factors using the data, that you think will improve your model's quality.
 
 2) For the purpose of classification, propose a model that can be used to predict whether a patient will be a readmit within 30 days. Justify your choice. Hint: use a decision criterion, such as AUC, to choose among a few candidate models.
 
+So based on the lasso results I will make 5 models: 
+- one of 13 variables excluding these 3
+- 3 models of 14 variables, adding each one individually
+- one model of 16 variables
+
+With these 5 models, I will compute the AUC for each and pick the best one (highest AIC)
+
+```{r message=TRUE, warning=FALSE}
+readmis_fin.1 <- readmis_cln.3 %>% select(-excluded)
+readmis_fin.2 <- readmis_cln.3 %>% select(c(varslasso, "num_procedures", "readmitted"))
+readmis_fin.3 <- readmis_cln.3 %>% select(c(varslasso, "glipizide", "readmitted"))
+readmis_fin.4 <- readmis_cln.3 %>% select(c(varslasso, "adm_src_mod", "readmitted"))
+readmis_fin.5 <- readmis_cln.3
+
+fit.fin.1 <- glm(readmitted ~., readmis_fin.1, family=binomial(logit))
+fit.fin.2 <- glm(readmitted ~., readmis_fin.2, family=binomial(logit))
+fit.fin.3 <- glm(readmitted ~., readmis_fin.3, family=binomial(logit))
+fit.fin.4 <- glm(readmitted ~., readmis_fin.4, family=binomial(logit))
+fit.fin.5 <- glm(readmitted ~., readmis_fin.5, family=binomial(logit))
+
+fit1.fitted.test <- predict(fit.fin.1, data.test, type="response")
+fit2.fitted.test <- predict(fit.fin.2, data.test, type="response")
+fit3.fitted.test <- predict(fit.fin.3, data.test, type="response")
+fit4.fitted.test <- predict(fit.fin.4, data.test, type="response")
+fit5.fitted.test <- predict(fit.fin.5, data.test, type="response")
+
+fit1.test.auc <- auc(data.test$readmitted, fit1.fitted.test)
+fit2.test.auc <- auc(data.test$readmitted, fit2.fitted.test)
+fit3.test.auc <- auc(data.test$readmitted, fit3.fitted.test)
+fit4.test.auc <- auc(data.test$readmitted, fit4.fitted.test)
+fit5.test.auc <- auc(data.test$readmitted, fit5.fitted.test)
+
+fit1.test.auc
+fit2.test.auc
+fit3.test.auc
+fit4.test.auc
+fit5.test.auc
+```
+We can see the the *AUC* changes very little between models. Thus, I will pick the one with the least variables - the simpler model
+
+```{r}
+fit1.test.roc <- roc(data.test$readmitted, fit1.fitted.test)
+fit5.test.roc <- roc(data.test$readmitted, fit5.fitted.test)
+
+
+plot(1-fit1.test.roc$specificities,
+     fit1.test.roc$sensitivities, col="red", lwd=3, type="l",
+     xlab="False Positive", ylab="Sensitivity")
+lines(1-fit5.test.roc$specificities, fit5.test.roc$sensitivities, col="blue", lwd=3)
+legend("bottomright",
+       c(paste0("Final FIT AUC=", round(fit1.test.roc$auc,2)),
+         paste0("Highest AUC AUC=", round(fit5.test.roc$auc, 2))),
+         col=c("red", "blue"), lty=1)
+```
+
+
+```{r}
+plot(fit1.test.roc$thresholds, 1-fit1.test.roc$specificities, col="green", pch=16,
+xlab="Threshold on prob",
+ylab="False Positive",
+main = "Thresholds vs. False Postive")
+```
+
+We can observe by the ROC that both models should perform virtually the same in all levels of threshholds. So picking the simplest one is the better call here, i.e. *fit.fin.1*
+
+
 3) Based on a quick and somewhat arbitrary guess, we estimate **it costs twice as much** to mislabel a readmission than it does to mislabel a non-readmission. Based on this risk ratio, propose a specific classification rule to minimize the cost. If you find any information that could provide a better cost estimate, please justify it in your write-up and use the better estimate in your answer.
+
+Based on Bayes’ rule, we can stablish a threshhold of *33.33%* probability to determine a readmission. with the model being *fit.fin.1* as mentioned in the prior item.
+
+```{r}
+ratio_of_costs <- 1/2
+P <- ratio_of_costs/(1+ratio_of_costs)
+P
+```
+
+Now, let's test how good our model is based on that threshold, and testing it against the validation data set.
+
+
+
+
+```{r}
+fit1.fitted.validation <- predict(fit.fin.1, data.test, type="response")
+
+fit1.pred.33 <- ifelse(fit1.fitted.validation > 1/3, "2", "1")
+
+confusionMatrix(data = as.factor(fit1.pred.33), # predicted value
+reference = as.factor(data.test$readmitted), 
+positive = levels(as.factor(data.test$readmitted))[2])
+
+```
+
+
+
+Thus, 
 
 Suggestion: You may use any of the methods covered so far in parts 1) and 2), and they need not be the same. Also keep in mind that a training/testing data split may be necessary. 
 
